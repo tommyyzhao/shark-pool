@@ -10,7 +10,7 @@ configs/**/*.conf
 # go
 /bin/
 /out/
-shark-pool
+/shark-pool
 *.exe
 
 # os / ide
