@@ -1,0 +1,85 @@
+# shark-pool
+#
+# Two default exits (US, UK) + a registry that exports paste-ready
+# 9router proxy-pool entries.
+#
+#   cp .env.example .env   # fill SURFSHARK_* service credentials
+#   # put OpenVPN configs in configs/us/ and configs/uk/
+#   docker compose up -d --build
+#
+# Dashboard/status:  http://127.0.0.1:8000  (US)  / 8001 (UK)
+# HTTP proxies:      http://127.0.0.1:8888  / 8889
+# SOCKS5:            socks5://127.0.0.1:1080 / 1081
+# Registry export:   http://127.0.0.1:8100/api/v1/9router/export
+
+x-exit-common: &exit-common
+  build: .
+  image: shark-pool:local
+  restart: unless-stopped
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - /dev/net/tun:/dev/net/tun
+  dns:
+    - 1.1.1.1
+    - 8.8.8.8
+  environment: &exit-env
+    SURFSHARK_USERNAME: ${SURFSHARK_USERNAME:?set in .env}
+    SURFSHARK_PASSWORD: ${SURFSHARK_PASSWORD:?set in .env}
+    HTTP_PORT: "8888"
+    SOCKS_PORT: "1080"
+    API_PORT: "8000"
+    AUTO_RECONNECT: "true"
+    CONNECT_TIMEOUT_SEC: "75"
+    HEALTH_INTERVAL_SEC: "30"
+    PUBLIC_HOST: "127.0.0.1"
+  sysctls:
+    - net.ipv6.conf.all.disable_ipv6=1
+    - net.ipv4.conf.all.src_valid_mark=1
+
+services:
+  us:
+    <<: *exit-common
+    container_name: shark-us
+    ports:
+      - "8888:8888"
+      - "1080:1080"
+      - "8000:8000"
+    volumes:
+      - ./configs/us:/vpn/configs:ro
+    environment:
+      <<: *exit-env
+      EXIT_NAME: us
+      VPN_CONFIG_DIR: /vpn/configs
+
+  uk:
+    <<: *exit-common
+    container_name: shark-uk
+    ports:
+      - "8889:8888"
+      - "1081:1080"
+      - "8001:8000"
+    volumes:
+      - ./configs/uk:/vpn/configs:ro
+    environment:
+      <<: *exit-env
+      EXIT_NAME: uk
+      VPN_CONFIG_DIR: /vpn/configs
+
+  registry:
+    build: .
+    image: shark-pool:local
+    container_name: shark-registry
+    restart: unless-stopped
+    depends_on:
+      - us
+      - uk
+    ports:
+      - "8100:8100"
+    environment:
+      SHARK_POOL_MODE: registry
+      API_PORT: "8100"
+      POLL_INTERVAL_SEC: "10"
+      REGISTRY_EXITS: >-
+        us|http://us:8000|http://127.0.0.1:8888|socks5://127.0.0.1:1080,
+        uk|http://uk:8000|http://127.0.0.1:8889|socks5://127.0.0.1:1081

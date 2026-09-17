@@ -1,0 +1,19 @@
+# secrets / local
+.env
+auth.txt
+wireguard.txt
+*.ovpn
+*.conf
+configs/**/*.ovpn
+configs/**/*.conf
+
+# go
+/bin/
+/out/
+shark-pool
+*.exe
+
+# os / ide
+.DS_Store
+.idea/
+.vscode/
