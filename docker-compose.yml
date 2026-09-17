@@ -1,16 +1,15 @@
 # shark-pool
 #
-# Two default exits (US, UK) + a registry that exports paste-ready
-# 9router proxy-pool entries.
+# Two country pools (US, UK) — every .ovpn in configs/<country>/ becomes a
+# concurrent tunnel with its own HTTP + SOCKS5 port — plus a registry that
+# exports paste-ready 9router proxy-pool entries for every location.
 #
 #   cp .env.example .env   # fill SURFSHARK_* service credentials
-#   # put OpenVPN configs in configs/us/ and configs/uk/
 #   docker compose up -d --build
 #
-# Dashboard/status:  http://127.0.0.1:8000  (US)  / 8001 (UK)
-# HTTP proxies:      http://127.0.0.1:8888  / 8889
-# SOCKS5:            socks5://127.0.0.1:1080 / 1081
-# Registry export:   http://127.0.0.1:8100/api/v1/9router/export
+# US locations: HTTP 8888+  SOCKS 1080+  API :8000
+# UK locations: HTTP 8920+  SOCKS 1120+  API :8001
+# Registry:     http://127.0.0.1:8100/api/v1/9router/export
 
 x-exit-common: &exit-common
   build: .
@@ -26,13 +25,12 @@ x-exit-common: &exit-common
   environment: &exit-env
     SURFSHARK_USERNAME: ${SURFSHARK_USERNAME:?set in .env}
     SURFSHARK_PASSWORD: ${SURFSHARK_PASSWORD:?set in .env}
-    HTTP_PORT: "8888"
-    SOCKS_PORT: "1080"
-    API_PORT: "8000"
     AUTO_RECONNECT: "true"
     CONNECT_TIMEOUT_SEC: "75"
     HEALTH_INTERVAL_SEC: "30"
     PUBLIC_HOST: "127.0.0.1"
+    # 0 = all .ovpn files in the config dir
+    MAX_SERVERS: "0"
   sysctls:
     - net.ipv6.conf.all.disable_ipv6=1
     - net.ipv4.conf.all.src_valid_mark=1
@@ -42,29 +40,36 @@ services:
     <<: *exit-common
     container_name: shark-us
     ports:
-      - "8888:8888"
-      - "1080:1080"
       - "8000:8000"
+      # HTTP + SOCKS ranges sized for ~24 US locations
+      - "8888-8912:8888-8912"
+      - "1080-1104:1080-1104"
     volumes:
       - ./configs/us:/vpn/configs:ro
     environment:
       <<: *exit-env
       EXIT_NAME: us
       VPN_CONFIG_DIR: /vpn/configs
+      API_PORT: "8000"
+      HTTP_PORT: "8888"
+      SOCKS_PORT: "1080"
 
   uk:
     <<: *exit-common
     container_name: shark-uk
     ports:
-      - "8889:8888"
-      - "1081:1080"
       - "8001:8000"
+      - "8920-8940:8920-8940"
+      - "1120-1140:1120-1140"
     volumes:
       - ./configs/uk:/vpn/configs:ro
     environment:
       <<: *exit-env
       EXIT_NAME: uk
       VPN_CONFIG_DIR: /vpn/configs
+      API_PORT: "8000"
+      HTTP_PORT: "8920"
+      SOCKS_PORT: "1120"
 
   registry:
     build: .
@@ -81,5 +86,5 @@ services:
       API_PORT: "8100"
       POLL_INTERVAL_SEC: "10"
       REGISTRY_EXITS: >-
-        us|http://us:8000|http://127.0.0.1:8888|socks5://127.0.0.1:1080,
-        uk|http://uk:8000|http://127.0.0.1:8889|socks5://127.0.0.1:1081
+        us|http://us:8000,
+        uk|http://uk:8000

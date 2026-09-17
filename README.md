@@ -1,115 +1,69 @@
 # shark-pool
 
-Multi-exit **Surfshark VPN proxy pool** for localhost. Each exit is an independent
-OpenVPN tunnel that publishes:
+Multi-location **Surfshark VPN proxy pool** for localhost. Each country container loads
+**every** `.ovpn` in its config folder and runs one concurrent tunnel + HTTP + SOCKS5
+proxy per location. A registry exports paste-ready [9Router](https://github.com/tommyyzhao/9router)
+proxy-pool entries for every live location.
 
-| Port (default US / UK) | Service |
+| Service | Default |
 |---|---|
-| `8888` / `8889` | HTTP/HTTPS proxy (CONNECT) |
-| `1080` / `1081` | SOCKS5 proxy |
-| `8000` / `8001` | Per-exit control API |
-| `8100` | Pool registry + 9router export |
+| US locations | HTTP `8888+` · SOCKS5 `1080+` · API `:8000` |
+| UK locations | HTTP `8920+` · SOCKS5 `1120+` · API `:8001` |
+| Registry | `:8100` — `/api/v1/9router/export` |
 
-Built for routing **selected** app traffic (e.g. [9Router](https://github.com/tommyyzhao/9router)
-provider connections) through distinct exit IPs while leaving the rest of the machine alone.
+## How it works
 
-## Prerequisites
+```
+configs/us/*.ovpn  (24 cities)     configs/uk/*.ovpn  (4 cities)
+        │                                  │
+        ▼                                  ▼
+   shark-us container                shark-uk container
+   tun0+tun1+… + SO_BINDTODEVICE     same
+   one HTTP/SOCKS port per city
+        │                                  │
+        └────────────┬─────────────────────┘
+                     ▼
+              shark-registry :8100
+         GET /api/v1/9router/export
+```
 
-- Docker + Docker Compose
-- A Surfshark subscription
-- **Service credentials** (not your account email/password):
-  [my.surfshark.com](https://my.surfshark.com/) → VPN → Manual Setup → OpenVPN / IKEv2 credentials
-- OpenVPN `.ovpn` files from the same Manual Setup page
+Each tunnel gets a unique `tunN`, local UDP `--lport`, and its proxy pins outbound
+sockets to that device — so every location has its **own exit IP**.
 
 ## Quick start
 
 ```bash
 git clone https://github.com/tommyyzhao/shark-pool.git
 cd shark-pool
-
 cp .env.example .env
-# edit .env → SURFSHARK_USERNAME / SURFSHARK_PASSWORD
+# SURFSHARK_USERNAME / SURFSHARK_PASSWORD = manual-setup service credentials
 
-# one (or more) .ovpn per exit directory
-# configs/us/us-nyc.prod.surfshark.com_udp.ovpn
-# configs/uk/uk-lon.prod.surfshark.com_udp.ovpn
-
+# drop .ovpn files into configs/us/ and configs/uk/
 docker compose up -d --build
 ```
 
 Verify:
 
 ```bash
-curl -s http://127.0.0.1:8000/api/v1/status | jq
-curl -s http://127.0.0.1:8100/api/v1/9router/export | jq
+curl -s http://127.0.0.1:8000/api/v1/status | jq '.connected_count, .server_count'
+curl -s http://127.0.0.1:8100/api/v1/9router/export | jq '.count'
 curl -x http://127.0.0.1:8888 -s https://api.ipify.org
-curl --socks5 127.0.0.1:1080 -s https://api.ipify.org
+curl -x http://127.0.0.1:8894 -s https://api.ipify.org   # different city → different IP
 ```
 
 ## 9Router integration
 
-9Router stores each pool entry as `{ name, proxyUrl, type: "http", ... }` and tests it
-with an HTTP CONNECT agent. shark-pool exports exactly that shape.
-
-1. Confirm the pool is up: `curl -s http://127.0.0.1:8100/api/v1/9router/export`
-2. In 9Router dashboard → **Proxy Pools** → add each pool (or copy from export):
-
-| Name | Proxy URL | Type |
-|---|---|---|
-| `shark-us` | `http://127.0.0.1:8888` | http |
-| `shark-uk` | `http://127.0.0.1:8889` | http |
-
-3. Bind a provider connection to a pool (or enable rotation across ≥2 pools).
-
-Per-exit export is also available:
-
 ```bash
-curl -s http://127.0.0.1:8000/api/v1/9router/export
-curl -s http://127.0.0.1:8001/api/v1/9router/export
+curl -s http://127.0.0.1:8100/api/v1/9router/export
 ```
 
-HTTP is primary for 9router compatibility (undici `ProxyAgent` / `type: http`).
-SOCKS5 ports are published for Telegram, Firefox, curl, etc.
+Returns one entry per live location:
 
-## Architecture
-
-```
-┌─────────────────────┐     ┌─────────────────────┐
-│  shark-us           │     │  shark-uk           │
-│  OpenVPN  → tun0    │     │  OpenVPN  → tun0    │
-│  HTTP :8888         │     │  HTTP :8889         │
-│  SOCKS5 :1080       │     │  SOCKS5 :1081       │
-│  API :8000          │     │  API :8001          │
-└─────────┬───────────┘     └─────────┬───────────┘
-          │                           │
-          └────────────┬──────────────┘
-                       ▼
-              shark-registry :8100
-              GET /api/v1/9router/export
+```json
+{ "name": "shark-us-nyc", "proxyUrl": "http://127.0.0.1:8905", "type": "http", "isActive": true }
 ```
 
-One container per exit. A thin Go binary (`shark-pool`) supervises OpenVPN and runs
-the local proxies + control API. A third container polls exits and serves a combined
-9router export.
-
-## API
-
-### Exit (`:8000` / `:8001`)
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/health` | 200 if tunnel up, 503 otherwise (API still up) |
-| GET | `/api/v1/status` | connected, server, exit IP, proxy URLs |
-| POST | `/api/v1/reconnect` | restart OpenVPN |
-| GET | `/api/v1/9router/export` | paste-ready pool entry |
-
-### Registry (`:8100`)
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/health` | registry liveness |
-| GET | `/api/v1/status` | all exits |
-| GET | `/api/v1/9router/export` | all pools for 9router |
+Import into **9Router → Proxy Pools** (type `http`), then rotate across ≥2 pools.
 
 ## Configuration
 
@@ -117,29 +71,38 @@ the local proxies + control API. A third container polls exits and serves a comb
 |---|---|---|
 | `SURFSHARK_USERNAME` | — | Service credential username |
 | `SURFSHARK_PASSWORD` | — | Service credential password |
-| `EXIT_NAME` | `exit` | Label (`us`, `uk`, …) |
-| `VPN_CONFIG_DIR` | `/vpn/configs` | Directory of `.ovpn` files |
-| `VPN_CONFIG` | first `.ovpn` | Explicit config path |
-| `HTTP_PORT` | `8888` | HTTP proxy port **inside** the container |
-| `SOCKS_PORT` | `1080` | SOCKS5 port inside the container |
-| `API_PORT` | `8000` | Control API port inside the container |
-| `PUBLIC_HOST` | `127.0.0.1` | Host used in exported proxy URLs |
-| `AUTO_RECONNECT` | `true` | Reconnect when tunnel drops |
-| `CONNECT_TIMEOUT_SEC` | `75` | OpenVPN connect wait |
-| `KILL_SWITCH` | `false` | Reserved |
+| `EXIT_NAME` | `exit` | Country label (`us`, `uk`) |
+| `VPN_CONFIG_DIR` | `/vpn/configs` | Folder of `.ovpn` files |
+| `HTTP_PORT` | `8888` | Base HTTP port (location *i* → base+*i*) |
+| `SOCKS_PORT` | `1080` | Base SOCKS5 port |
+| `MAX_SERVERS` | `0` (all) | Cap concurrent locations |
+| `PUBLIC_HOST` | `127.0.0.1` | Host in exported proxy URLs |
+| `AUTO_RECONNECT` | `true` | Reconnect dropped tunnels |
 
-Registry mode: `SHARK_POOL_MODE=registry` + `REGISTRY_EXITS=name|healthURL|publicHTTP[|publicSOCKS],…`
+Registry: `REGISTRY_EXITS=us|http://us:8000,uk|http://uk:8000`
 
-## Adding exits
+## API
 
-1. Create `configs/<name>/` with an `.ovpn`.
-2. Duplicate the `us` service in `docker-compose.yml` with new host ports.
-3. Append the exit to `REGISTRY_EXITS` using the **host** proxy port.
+### Country (`:8000` / `:8001`)
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/v1/status` | All locations + exit IPs |
+| GET | `/api/v1/9router/export` | Paste-ready pools |
+| POST | `/api/v1/reconnect?id=us-nyc` | Reconnect one or all |
+
+### Registry (`:8100`)
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/v1/status` | Flattened locations |
+| GET | `/api/v1/9router/export` | All pools for 9router |
 
 ## Notes
 
 - Credentials are **manual-setup service credentials**, not account login.
-- `.ovpn` files and `.env` are gitignored — never commit them.
+- Surfshark may cap concurrent OpenVPN sessions; some cities can flap — auto-reconnect retries.
+- `.ovpn` and `.env` are gitignored.
 - Not affiliated with Surfshark.
 
 ## License

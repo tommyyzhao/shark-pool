@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,6 +19,8 @@ import (
 	"github.com/tommyyzhao/shark-pool/internal/registry"
 	"github.com/tommyyzhao/shark-pool/internal/vpn"
 )
+
+type closer interface{ Close() error }
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
@@ -50,35 +53,77 @@ func runExit(ctx context.Context) error {
 		return err
 	}
 	log.SetPrefix(fmt.Sprintf("[%s] ", cfg.Name))
-	log.Printf("starting exit server=%s http=:%d socks=:%d api=:%d",
-		fileName(cfg.ConfigPath), cfg.HTTPPort, cfg.SOCKSPort, cfg.APIPort)
+	log.Printf("starting country pool: %d locations, http base=:%d socks base=:%d api=:%d",
+		len(cfg.ConfigPaths), cfg.HTTPPortBase, cfg.SOCKSPortBase, cfg.APIPort)
 
-	httpProxy := proxy.NewHTTP(net.JoinHostPort(cfg.Bind, strconv.Itoa(cfg.HTTPPort)))
-	socks := proxy.NewSOCKS5(net.JoinHostPort(cfg.Bind, strconv.Itoa(cfg.SOCKSPort)))
-	if err := httpProxy.Start(); err != nil {
-		return err
-	}
-	if err := socks.Start(); err != nil {
-		_ = httpProxy.Close()
-		return err
+	var units []*api.Unit
+	var proxies []closer
+
+	for i, path := range cfg.ConfigPaths {
+		label := config.ServerLabel(path)
+		httpPort := cfg.HTTPPortBase + i
+		socksPort := cfg.SOCKSPortBase + i
+		dev := fmt.Sprintf("tun%d", i)
+
+		httpProxy := proxy.NewHTTPBindDevice(net.JoinHostPort(cfg.Bind, strconv.Itoa(httpPort)), dev)
+		if err := httpProxy.Start(); err != nil {
+			shutdownAll(proxies)
+			return fmt.Errorf("http proxy %s: %w", label, err)
+		}
+		socks := proxy.NewSOCKS5BindDevice(net.JoinHostPort(cfg.Bind, strconv.Itoa(socksPort)), dev)
+		if err := socks.Start(); err != nil {
+			_ = httpProxy.Close()
+			shutdownAll(proxies)
+			return fmt.Errorf("socks %s: %w", label, err)
+		}
+		proxies = append(proxies, httpProxy, socks)
+
+		unitCfg := *cfg
+		unitCfg.ConfigPath = path
+		// Unique local UDP port so concurrent OpenVPNs don't mix replies.
+		lport := 20000 + i
+		sup := vpn.NewSupervisorDev(&unitCfg, dev, lport)
+
+		units = append(units, &api.Unit{
+			Label:     label,
+			Config:    path,
+			HTTPPort:  httpPort,
+			SOCKSPort: socksPort,
+			Sup:       sup,
+		})
+		log.Printf("location %s → %s http=:%d socks=:%d", label, dev, httpPort, socksPort)
 	}
 
-	sup := vpn.NewSupervisor(cfg)
-	srv := api.NewServer(cfg, sup, os.Getenv("PUBLIC_HOST"))
+	srv := api.NewServer(cfg, units, cfg.PublicHost)
 	if err := srv.Start(); err != nil {
+		shutdownAll(proxies)
 		return err
 	}
 
-	connectCtx, cancelConnect := context.WithTimeout(ctx, time.Duration(cfg.ConnectTimeoutSec)*time.Second+15*time.Second)
-	err = sup.Start(connectCtx)
-	cancelConnect()
-	if err != nil {
-		log.Printf("initial connect failed (API stays up): %v", err)
-	} else {
-		srv.RefreshIP()
+	// Connect with limited concurrency so we don't stampede OpenVPN.
+	sem := make(chan struct{}, 2)
+	var wg sync.WaitGroup
+	for i, u := range units {
+		i, u := i, u
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// stagger starts slightly
+			time.Sleep(time.Duration(i) * 200 * time.Millisecond)
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			cctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.ConnectTimeoutSec)*time.Second+15*time.Second)
+			defer cancel()
+			if err := u.Sup.Start(cctx); err != nil {
+				log.Printf("[%s] connect failed (API stays up): %v", u.Label, err)
+			} else {
+				srv.RefreshIP(u)
+			}
+		}()
 	}
+	wg.Wait()
+	log.Printf("initial connect phase done: %d locations", len(units))
 
-	// background health / reconnect
 	go func() {
 		t := time.NewTicker(time.Duration(cfg.HealthIntervalSec) * time.Second)
 		defer t.Stop()
@@ -87,34 +132,44 @@ func runExit(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if sup.Connected() {
-					srv.RefreshIP()
-					continue
+				for _, u := range units {
+					u := u
+					if u.Sup.Connected() {
+						srv.RefreshIP(u)
+						continue
+					}
+					if !cfg.AutoReconnect {
+						continue
+					}
+					log.Printf("[%s] tunnel down — reconnecting", u.Label)
+					cctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.ConnectTimeoutSec)*time.Second+10*time.Second)
+					if err := u.Sup.Start(cctx); err != nil {
+						log.Printf("[%s] reconnect failed: %v", u.Label, err)
+					} else {
+						srv.RefreshIP(u)
+					}
+					cancel()
 				}
-				if !cfg.AutoReconnect {
-					continue
-				}
-				log.Printf("tunnel down — attempting reconnect")
-				cctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.ConnectTimeoutSec)*time.Second+10*time.Second)
-				if err := sup.Start(cctx); err != nil {
-					log.Printf("reconnect failed: %v", err)
-				} else {
-					srv.RefreshIP()
-				}
-				cancel()
 			}
 		}
 	}()
 
 	<-ctx.Done()
 	log.Printf("shutting down")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
-	_ = sup.Stop()
-	_ = httpProxy.Close()
-	_ = socks.Close()
+	for _, u := range units {
+		_ = u.Sup.Stop()
+	}
+	shutdownAll(proxies)
 	return nil
+}
+
+func shutdownAll(proxies []closer) {
+	for _, p := range proxies {
+		_ = p.Close()
+	}
 }
 
 func runRegistry(ctx context.Context) error {
@@ -132,9 +187,4 @@ func runRegistry(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
-}
-
-func fileName(p string) string {
-	parts := strings.Split(p, "/")
-	return parts[len(parts)-1]
 }

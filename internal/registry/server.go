@@ -14,7 +14,7 @@ import (
 	"github.com/tommyyzhao/shark-pool/internal/config"
 )
 
-// Pool is a 9router-ready proxy pool entry from one exit.
+// Pool is a 9router-ready proxy pool entry from one location.
 type Pool struct {
 	Name        string `json:"name"`
 	ProxyURL    string `json:"proxyUrl"`
@@ -22,24 +22,26 @@ type Pool struct {
 	NoProxy     string `json:"noProxy"`
 	IsActive    bool   `json:"isActive"`
 	StrictProxy bool   `json:"strictProxy"`
+	Location    string `json:"location,omitempty"`
+	ExitIP      string `json:"exitIp,omitempty"`
+	Country     string `json:"country,omitempty"`
 }
 
-type ExitSnapshot struct {
-	Name       string `json:"name"`
+type LocationSnap struct {
+	Country    string `json:"country"`
+	ID         string `json:"id"`
 	Connected  bool   `json:"connected"`
 	ExitIP     string `json:"exit_ip,omitempty"`
-	Server     string `json:"server,omitempty"`
 	HTTPProxy  string `json:"http_proxy"`
 	SOCKSProxy string `json:"socks_proxy,omitempty"`
 	Healthy    bool   `json:"healthy"`
-	Error      string `json:"error,omitempty"`
 }
 
 type Server struct {
 	cfg *config.Registry
 
-	mu     sync.Mutex
-	snaps  []ExitSnapshot
+	mu      sync.Mutex
+	snaps   []LocationSnap
 	httpSrv *http.Server
 }
 
@@ -97,61 +99,95 @@ func (s *Server) pollLoop(ctx context.Context) {
 }
 
 func (s *Server) pollOnce(ctx context.Context) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	snaps := make([]ExitSnapshot, 0, len(s.cfg.Exits))
+	client := &http.Client{Timeout: 8 * time.Second}
+	var snaps []LocationSnap
 	for _, e := range s.cfg.Exits {
-		snap := ExitSnapshot{
-			Name:       e.Name,
-			HTTPProxy:  e.PublicHTTP,
-			SOCKSProxy: e.PublicSOCKS,
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.HealthURL+"/api/v1/status", nil)
-		if err != nil {
-			snap.Error = err.Error()
-			snaps = append(snaps, snap)
-			continue
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			snap.Error = err.Error()
-			snaps = append(snaps, snap)
-			continue
-		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		_ = resp.Body.Close()
-		if err != nil {
-			snap.Error = err.Error()
-			snaps = append(snaps, snap)
-			continue
-		}
-		var st struct {
-			Connected bool   `json:"connected"`
-			ExitIP    string `json:"exit_ip"`
-			Server    string `json:"server"`
-		}
-		if err := json.Unmarshal(body, &st); err != nil {
-			snap.Error = "bad status payload"
-			snaps = append(snaps, snap)
-			continue
-		}
-		snap.Connected = st.Connected
-		snap.ExitIP = st.ExitIP
-		snap.Server = st.Server
-		snap.Healthy = st.Connected
-		snaps = append(snaps, snap)
+		snaps = append(snaps, s.pollExit(ctx, client, e)...)
 	}
 	s.mu.Lock()
 	s.snaps = snaps
 	s.mu.Unlock()
 }
 
+func (s *Server) pollExit(ctx context.Context, client *http.Client, e config.RegistryExit) []LocationSnap {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.HealthURL+"/api/v1/status", nil)
+	if err != nil {
+		return []LocationSnap{{Country: e.Name, ID: e.Name, Healthy: false}}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("poll %s: %v", e.Name, err)
+		return []LocationSnap{{Country: e.Name, ID: e.Name, Healthy: false}}
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return []LocationSnap{{Country: e.Name, ID: e.Name, Healthy: false}}
+	}
+
+	// New multi-server shape: { servers: [...] }
+	var multi struct {
+		Servers []struct {
+			ID         string `json:"id"`
+			Connected  bool   `json:"connected"`
+			ExitIP     string `json:"exit_ip"`
+			HTTPProxy  string `json:"http_proxy"`
+			SOCKSProxy string `json:"socks_proxy"`
+		} `json:"servers"`
+	}
+	if err := json.Unmarshal(body, &multi); err == nil && len(multi.Servers) > 0 {
+		out := make([]LocationSnap, 0, len(multi.Servers))
+		for _, srv := range multi.Servers {
+			out = append(out, LocationSnap{
+				Country:    e.Name,
+				ID:         srv.ID,
+				Connected:  srv.Connected,
+				ExitIP:     srv.ExitIP,
+				HTTPProxy:  srv.HTTPProxy,
+				SOCKSProxy: srv.SOCKSProxy,
+				Healthy:    srv.Connected,
+			})
+		}
+		return out
+	}
+
+	// Legacy single-server shape
+	var single struct {
+		Connected  bool   `json:"connected"`
+		ExitIP     string `json:"exit_ip"`
+		HTTPProxy  string `json:"http_proxy"`
+		SOCKSProxy string `json:"socks_proxy"`
+		Server     string `json:"server"`
+	}
+	if err := json.Unmarshal(body, &single); err != nil {
+		return []LocationSnap{{Country: e.Name, ID: e.Name, Healthy: false}}
+	}
+	return []LocationSnap{{
+		Country:    e.Name,
+		ID:         e.Name,
+		Connected:  single.Connected,
+		ExitIP:     single.ExitIP,
+		HTTPProxy:  single.HTTPProxy,
+		SOCKSProxy: single.SOCKSProxy,
+		Healthy:    single.Connected,
+	}}
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	snaps := s.snaps
 	s.mu.Unlock()
+	connected := 0
+	for _, sn := range snaps {
+		if sn.Connected {
+			connected++
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"exits": snaps,
-		"updated_at": time.Now().UTC().Format(time.RFC3339),
+		"locations":       snaps,
+		"location_count":  len(snaps),
+		"connected_count": connected,
+		"updated_at":      time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
@@ -163,17 +199,21 @@ func (s *Server) handlePools(w http.ResponseWriter, r *http.Request) {
 	pools := make([]Pool, 0, len(snaps))
 	for _, sn := range snaps {
 		pools = append(pools, Pool{
-			Name:        "shark-" + sn.Name,
+			Name:        "shark-" + sn.ID,
 			ProxyURL:    sn.HTTPProxy,
 			Type:        "http",
 			NoProxy:     "",
 			IsActive:    sn.Connected,
 			StrictProxy: false,
+			Location:    sn.ID,
+			ExitIP:      sn.ExitIP,
+			Country:     sn.Country,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"pools": pools,
-		"note":  "Paste pools into 9router → Dashboard → Proxy Pools (type http).",
+		"count": len(pools),
+		"note":  "Import into 9router → Proxy Pools (type http). Enable rotation across ≥2 pools.",
 	})
 }
 

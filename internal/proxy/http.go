@@ -15,7 +15,8 @@ import (
 
 // HTTPProxy is a minimal HTTP/HTTPS proxy (CONNECT + absolute-URI).
 type HTTPProxy struct {
-	Addr string
+	Addr       string
+	BindDevice string // e.g. tun0 — pin outbound sockets to this iface
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -24,6 +25,13 @@ type HTTPProxy struct {
 
 func NewHTTP(addr string) *HTTPProxy {
 	return &HTTPProxy{Addr: addr, conns: make(map[net.Conn]struct{})}
+}
+
+// NewHTTPBindDevice creates an HTTP proxy that dials out via a specific network device.
+func NewHTTPBindDevice(addr, bindDevice string) *HTTPProxy {
+	p := NewHTTP(addr)
+	p.BindDevice = bindDevice
+	return p
 }
 
 func (p *HTTPProxy) Start() error {
@@ -104,7 +112,7 @@ func (p *HTTPProxy) handleConnect(c net.Conn, req *http.Request) {
 	if !strings.Contains(host, ":") {
 		host += ":443"
 	}
-	up, err := net.DialTimeout("tcp", host, 15*time.Second)
+	up, err := dialContext(context.Background(), "tcp", host, p.BindDevice, 15*time.Second)
 	if err != nil {
 		_, _ = c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
@@ -137,9 +145,9 @@ func (p *HTTPProxy) handleHTTP(c net.Conn, req *http.Request) {
 		Timeout:       60 * time.Second,
 		Transport: &http.Transport{
 			DisableKeepAlives: true,
-			DialContext: (&net.Dialer{
-				Timeout: 15 * time.Second,
-			}).DialContext,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialContext(ctx, network, addr, p.BindDevice, 15*time.Second)
+			},
 		},
 	}
 	resp, err := client.Do(outReq)

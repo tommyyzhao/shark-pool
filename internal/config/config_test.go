@@ -14,9 +14,15 @@ func TestLoadExitRequiresCreds(t *testing.T) {
 	}
 }
 
-func TestLoadExitFindsOvpn(t *testing.T) {
+func TestLoadExitListsAllOvpn(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "us.ovpn"), []byte("dev tun\n"), 0o644); err != nil {
+	for _, name := range []string{"us-nyc.prod.surfshark.com_udp.ovpn", "us-lax.prod.surfshark.com_udp.ovpn", "us-chi.prod.surfshark.com_udp.ovpn"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("dev tun\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// non-ovpn ignored
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("SURFSHARK_USERNAME", "u")
@@ -24,31 +30,56 @@ func TestLoadExitFindsOvpn(t *testing.T) {
 	t.Setenv("VPN_CONFIG_DIR", dir)
 	t.Setenv("VPN_CONFIG", "")
 	t.Setenv("EXIT_NAME", "us")
+	t.Setenv("MAX_SERVERS", "0")
+	t.Setenv("HTTP_PORT", "8888")
+	t.Setenv("SOCKS_PORT", "1080")
 	cfg, err := LoadExit()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ConfigPath != filepath.Join(dir, "us.ovpn") {
-		t.Fatalf("config path = %s", cfg.ConfigPath)
+	if len(cfg.ConfigPaths) != 3 {
+		t.Fatalf("want 3 configs, got %d: %v", len(cfg.ConfigPaths), cfg.ConfigPaths)
 	}
-	if cfg.HTTPPort != 8888 || cfg.SOCKSPort != 1080 {
-		t.Fatalf("ports http=%d socks=%d", cfg.HTTPPort, cfg.SOCKSPort)
+	if ServerLabel(cfg.ConfigPaths[0]) != "us-chi" {
+		t.Fatalf("sorted label[0]=%s", ServerLabel(cfg.ConfigPaths[0]))
+	}
+}
+
+func TestLoadExitMaxServers(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"a.ovpn", "b.ovpn", "c.ovpn"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("dev tun\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("SURFSHARK_USERNAME", "u")
+	t.Setenv("SURFSHARK_PASSWORD", "p")
+	t.Setenv("VPN_CONFIG_DIR", dir)
+	t.Setenv("VPN_CONFIG", "")
+	t.Setenv("MAX_SERVERS", "2")
+	cfg, err := LoadExit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.ConfigPaths) != 2 {
+		t.Fatalf("want 2, got %d", len(cfg.ConfigPaths))
+	}
+}
+
+func TestServerLabel(t *testing.T) {
+	got := ServerLabel("/vpn/configs/us-nyc.prod.surfshark.com_udp.ovpn")
+	if got != "us-nyc" {
+		t.Fatalf("got %q", got)
 	}
 }
 
 func TestLoadRegistry(t *testing.T) {
-	t.Setenv("REGISTRY_EXITS", "us|http://us:8000|http://127.0.0.1:8888|socks5://127.0.0.1:1080,uk|http://uk:8000|http://127.0.0.1:8889")
+	t.Setenv("REGISTRY_EXITS", "us|http://us:8000,uk|http://uk:8000")
 	r, err := LoadRegistry()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(r.Exits) != 2 {
-		t.Fatalf("exits = %d", len(r.Exits))
-	}
-	if r.Exits[0].PublicHTTP != "http://127.0.0.1:8888" {
-		t.Fatalf("public http = %s", r.Exits[0].PublicHTTP)
-	}
-	if r.Exits[1].PublicSOCKS != "" {
-		t.Fatalf("expected empty socks for uk, got %q", r.Exits[1].PublicSOCKS)
+	if len(r.Exits) != 2 || r.Exits[0].Name != "us" || r.Exits[1].HealthURL != "http://uk:8000" {
+		t.Fatalf("exits=%+v", r.Exits)
 	}
 }

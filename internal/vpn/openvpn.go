@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,11 +19,14 @@ import (
 
 // Supervisor runs OpenVPN as a child process and tracks connection state.
 type Supervisor struct {
-	cfg *config.Exit
+	cfg     *config.Exit
+	devName string // e.g. tun0
+	lport   int    // unique local UDP port; 0 = default
 
 	mu        sync.Mutex
 	cmd       *exec.Cmd
 	authFile  string
+	cfgFile   string
 	connected bool
 	startedAt time.Time
 	lastErr   string
@@ -32,8 +36,17 @@ type Supervisor struct {
 }
 
 func NewSupervisor(cfg *config.Exit) *Supervisor {
-	return &Supervisor{cfg: cfg, server: filepath.Base(cfg.ConfigPath)}
+	return &Supervisor{cfg: cfg, server: filepath.Base(cfg.ConfigPath), devName: "tun"}
 }
+
+func NewSupervisorDev(cfg *config.Exit, devName string, lport int) *Supervisor {
+	if devName == "" {
+		devName = "tun"
+	}
+	return &Supervisor{cfg: cfg, server: filepath.Base(cfg.ConfigPath), devName: devName, lport: lport}
+}
+
+func (s *Supervisor) DevName() string { return s.devName }
 
 func (s *Supervisor) Server() string {
 	s.mu.Lock()
@@ -76,15 +89,27 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		return err
 	}
 
+	cfgPath := s.cfg.ConfigPath
+	if s.lport > 0 {
+		patched, err := s.writePatchedConfig()
+		if err != nil {
+			return err
+		}
+		cfgPath = patched
+	}
+
 	cmd := exec.Command("openvpn",
-		"--config", s.cfg.ConfigPath,
+		"--config", cfgPath,
 		"--auth-user-pass", s.authFile,
 		"--auth-nocache",
 		"--client",
 		"--pull",
-		"--dev", "tun",
+		"--dev", s.devName,
 		"--script-security", "2",
 	)
+	if s.lport > 0 {
+		cmd.Args = append(cmd.Args, "--lport", strconv.Itoa(s.lport))
+	}
 	cmd.Stdout = log.Writer()
 	cmd.Stderr = log.Writer()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -237,14 +262,57 @@ func (s *Supervisor) writeAuth() error {
 	return nil
 }
 
+// writePatchedConfig copies the .ovpn without `nobind` so --lport can bind a unique UDP port.
+func (s *Supervisor) writePatchedConfig() (string, error) {
+	raw, err := os.ReadFile(s.cfg.ConfigPath)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(string(raw), "\n") {
+		trim := strings.TrimSpace(line)
+		if trim == "nobind" || strings.HasPrefix(trim, "nobind ") || strings.HasPrefix(trim, "nobind\t") {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	f, err := os.CreateTemp("", "shark-cfg-*.ovpn")
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.WriteString(b.String()); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	s.mu.Lock()
+	if s.cfgFile != "" {
+		_ = os.Remove(s.cfgFile)
+	}
+	s.cfgFile = f.Name()
+	s.mu.Unlock()
+	return f.Name(), nil
+}
+
 func (s *Supervisor) tunnelUp() bool {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return false
 	}
+	want := s.devName
 	for _, iface := range ifaces {
-		if !strings.HasPrefix(iface.Name, "tun") && !strings.HasPrefix(iface.Name, "wg") {
+		if want != "tun" && want != "" && iface.Name != want {
 			continue
+		}
+		if want == "tun" || want == "" {
+			if !strings.HasPrefix(iface.Name, "tun") && !strings.HasPrefix(iface.Name, "wg") {
+				continue
+			}
 		}
 		addrs, err := iface.Addrs()
 		if err != nil {

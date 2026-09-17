@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -17,8 +18,9 @@ import (
 	"github.com/tommyyzhao/shark-pool/internal/vpn"
 )
 
-// ExitStatus is the public status payload for one exit.
-type ExitStatus struct {
+// ServerStatus is the public status of one location inside a country pool.
+type ServerStatus struct {
+	ID         string `json:"id"`
 	Exit       string `json:"exit"`
 	Connected  bool   `json:"connected"`
 	Server     string `json:"server"`
@@ -27,7 +29,17 @@ type ExitStatus struct {
 	UptimeSec  int64  `json:"uptime_sec"`
 	HTTPProxy  string `json:"http_proxy"`
 	SOCKSProxy string `json:"socks_proxy"`
-	UpdatedAt  string `json:"updated_at"`
+	HTTPPort   int    `json:"http_port"`
+	SOCKSPort  int    `json:"socks_port"`
+}
+
+// PoolStatus is the country-container aggregate.
+type PoolStatus struct {
+	Exit          string         `json:"exit"`
+	ServerCount   int            `json:"server_count"`
+	ConnectedCount int           `json:"connected_count"`
+	Servers       []ServerStatus `json:"servers"`
+	UpdatedAt     string         `json:"updated_at"`
 }
 
 // NineRouterPool is a paste-ready 9router proxy-pool entry.
@@ -38,26 +50,41 @@ type NineRouterPool struct {
 	NoProxy     string `json:"noProxy"`
 	IsActive    bool   `json:"isActive"`
 	StrictProxy bool   `json:"strictProxy"`
+	Location    string `json:"location,omitempty"`
+	ExitIP      string `json:"exitIp,omitempty"`
 }
 
-// Server is the per-exit control API.
+// Unit is one concurrent tunnel + proxies.
+type Unit struct {
+	Label     string
+	Config    string
+	HTTPPort  int
+	SOCKSPort int
+	Sup       *vpn.Supervisor
+
+	mu sync.Mutex
+	ip string
+}
+
+// Server is the country control API.
 type Server struct {
-	cfg *config.Exit
-	sup *vpn.Supervisor
-	// Public host used in 9router export (defaults to 127.0.0.1).
+	cfg        *config.Exit
+	units      []*Unit
 	publicHost string
-
-	mu   sync.Mutex
-	ip   string
-	httpSrv *http.Server
+	httpSrv    *http.Server
 }
 
-func NewServer(cfg *config.Exit, sup *vpn.Supervisor, publicHost string) *Server {
+func NewServer(cfg *config.Exit, units []*Unit, publicHost string) *Server {
+	if publicHost == "" {
+		publicHost = cfg.PublicHost
+	}
 	if publicHost == "" {
 		publicHost = "127.0.0.1"
 	}
-	return &Server{cfg: cfg, sup: sup, publicHost: publicHost}
+	return &Server{cfg: cfg, units: units, publicHost: publicHost}
 }
+
+func (s *Server) Units() []*Unit { return s.units }
 
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
@@ -73,7 +100,7 @@ func (s *Server) Start() error {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Printf("control API on http://%s", s.httpSrv.Addr)
+	log.Printf("control API on http://%s (%d locations)", s.httpSrv.Addr, len(s.units))
 	go func() {
 		if err := s.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("api error: %v", err)
@@ -89,25 +116,17 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.httpSrv.Shutdown(ctx)
 }
 
-func (s *Server) HTTPProxyAddr() string {
-	return net.JoinHostPort(s.cfg.Bind, strconv.Itoa(s.cfg.HTTPPort))
+func (s *Server) httpURL(port int) string {
+	return fmt.Sprintf("http://%s:%d", s.publicHost, port)
 }
 
-func (s *Server) SOCKSAddr() string {
-	return net.JoinHostPort(s.cfg.Bind, strconv.Itoa(s.cfg.SOCKSPort))
+func (s *Server) socksURL(port int) string {
+	return fmt.Sprintf("socks5://%s:%d", s.publicHost, port)
 }
 
-func (s *Server) HTTPProxyURL() string {
-	return fmt.Sprintf("http://%s:%d", s.publicHost, s.cfg.HTTPPort)
-}
-
-func (s *Server) SOCKSURL() string {
-	return fmt.Sprintf("socks5://%s:%d", s.publicHost, s.cfg.SOCKSPort)
-}
-
-// RefreshIP probes exit IP through the local HTTP proxy.
-func (s *Server) RefreshIP() {
-	proxyURL := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(s.cfg.HTTPPort))}
+// RefreshIP probes exit IP through a unit's local HTTP proxy.
+func (s *Server) RefreshIP(u *Unit) {
+	proxyURL := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(u.HTTPPort))}
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
@@ -125,36 +144,59 @@ func (s *Server) RefreshIP() {
 	}
 	ip := string(body)
 	if net.ParseIP(ip) != nil {
-		s.mu.Lock()
-		s.ip = ip
-		s.mu.Unlock()
+		u.mu.Lock()
+		u.ip = ip
+		u.mu.Unlock()
 	}
 }
 
-func (s *Server) Status() ExitStatus {
-	s.mu.Lock()
-	ip := s.ip
-	s.mu.Unlock()
-	return ExitStatus{
+func (s *Server) unitStatus(u *Unit) ServerStatus {
+	u.mu.Lock()
+	ip := u.ip
+	u.mu.Unlock()
+	return ServerStatus{
+		ID:         u.Label,
 		Exit:       s.cfg.Name,
-		Connected:  s.sup.Connected(),
-		Server:     s.sup.Server(),
+		Connected:  u.Sup.Connected(),
+		Server:     u.Sup.Server(),
 		ExitIP:     ip,
-		LastError:  s.sup.LastError(),
-		UptimeSec:  int64(s.sup.Uptime().Seconds()),
-		HTTPProxy:  s.HTTPProxyURL(),
-		SOCKSProxy: s.SOCKSURL(),
-		UpdatedAt:  time.Now().UTC().Format(time.RFC3339),
+		LastError:  u.Sup.LastError(),
+		UptimeSec:  int64(u.Sup.Uptime().Seconds()),
+		HTTPProxy:  s.httpURL(u.HTTPPort),
+		SOCKSProxy: s.socksURL(u.SOCKSPort),
+		HTTPPort:   u.HTTPPort,
+		SOCKSPort:  u.SOCKSPort,
+	}
+}
+
+func (s *Server) Status() PoolStatus {
+	servers := make([]ServerStatus, 0, len(s.units))
+	connected := 0
+	for _, u := range s.units {
+		st := s.unitStatus(u)
+		if st.Connected {
+			connected++
+		}
+		servers = append(servers, st)
+	}
+	sort.Slice(servers, func(i, j int) bool { return servers[i].ID < servers[j].ID })
+	return PoolStatus{
+		Exit:           s.cfg.Name,
+		ServerCount:    len(servers),
+		ConnectedCount: connected,
+		Servers:        servers,
+		UpdatedAt:      time.Now().UTC().Format(time.RFC3339),
 	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	if s.sup.Connected() {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-		return
+	for _, u := range s.units {
+		if u.Sup.Connected() {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
 	}
-	// API is up even if tunnel is down — useful for registry polling.
 	w.WriteHeader(http.StatusServiceUnavailable)
 	_, _ = w.Write([]byte("vpn down"))
 }
@@ -168,32 +210,54 @@ func (s *Server) handleReconnect(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
 		return
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.cfg.ConnectTimeoutSec)*time.Second+10*time.Second)
-		defer cancel()
-		if err := s.sup.Reconnect(ctx); err != nil {
-			log.Printf("[%s] reconnect failed: %v", s.cfg.Name, err)
-		} else {
-			s.RefreshIP()
+	id := r.URL.Query().Get("id")
+	targets := s.units
+	if id != "" {
+		targets = nil
+		for _, u := range s.units {
+			if u.Label == id {
+				targets = []*Unit{u}
+				break
+			}
 		}
-	}()
-	writeJSON(w, http.StatusAccepted, map[string]string{"ok": "true", "message": "reconnect started"})
+		if targets == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown id"})
+			return
+		}
+	}
+	for _, u := range targets {
+		u := u
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.cfg.ConnectTimeoutSec)*time.Second+10*time.Second)
+			defer cancel()
+			if err := u.Sup.Reconnect(ctx); err != nil {
+				log.Printf("[%s] reconnect failed: %v", u.Label, err)
+			} else {
+				s.RefreshIP(u)
+			}
+		}()
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "message": "reconnect started", "targets": len(targets)})
 }
 
 func (s *Server) handle9RouterExport(w http.ResponseWriter, r *http.Request) {
 	st := s.Status()
-	active := st.Connected
+	pools := make([]NineRouterPool, 0, len(st.Servers))
+	for _, srv := range st.Servers {
+		pools = append(pools, NineRouterPool{
+			Name:        "shark-" + srv.ID,
+			ProxyURL:    srv.HTTPProxy,
+			Type:        "http",
+			NoProxy:     "",
+			IsActive:    srv.Connected,
+			StrictProxy: false,
+			Location:    srv.ID,
+			ExitIP:      srv.ExitIP,
+		})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"pools": []NineRouterPool{
-			{
-				Name:        "shark-" + s.cfg.Name,
-				ProxyURL:    s.HTTPProxyURL(),
-				Type:        "http",
-				NoProxy:     "",
-				IsActive:    active,
-				StrictProxy: false,
-			},
-		},
+		"exit":   s.cfg.Name,
+		"pools":  pools,
 		"status": st,
 	})
 }

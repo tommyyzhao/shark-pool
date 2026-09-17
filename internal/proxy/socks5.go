@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -13,7 +14,8 @@ import (
 
 // SOCKS5Proxy implements CONNECT-only SOCKS5 (no auth).
 type SOCKS5Proxy struct {
-	Addr string
+	Addr       string
+	BindDevice string
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -22,6 +24,12 @@ type SOCKS5Proxy struct {
 
 func NewSOCKS5(addr string) *SOCKS5Proxy {
 	return &SOCKS5Proxy{Addr: addr, conns: make(map[net.Conn]struct{})}
+}
+
+func NewSOCKS5BindDevice(addr, bindDevice string) *SOCKS5Proxy {
+	p := NewSOCKS5(addr)
+	p.BindDevice = bindDevice
+	return p
 }
 
 func (p *SOCKS5Proxy) Start() error {
@@ -137,7 +145,7 @@ func (p *SOCKS5Proxy) handle(c net.Conn) {
 	port := binary.BigEndian.Uint16(portB)
 	addr := net.JoinHostPort(host, strconv.Itoa(int(port)))
 
-	up, err := net.DialTimeout("tcp", addr, 15*time.Second)
+	up, err := dialContext(context.Background(), "tcp", addr, p.BindDevice, 15*time.Second)
 	if err != nil {
 		p.reply(c, 0x05, net.IPv4zero, 0)
 		return
